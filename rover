@@ -3,33 +3,27 @@
 // Définir les broches pour les capteurs SRF05
 const int trigPin[4] = {4, 6, 8, 10};
 const int echoPin[4] = {5, 7, 9, 11};
+long distances[4] = {0, 0, 0, 0};
 
 // Définir les broches pour la LED
 const int GreenledPin = 2;  // Broche pour la LED verte
-const int RedledPin = 3;    // Broche pour la LED rouge
+const int RedledPin = 3;
 
-// Variables pour le servomoteur
-const int servoPin = 12;
-Servo myServo;
-int currentAngle = 90;
-
-// Variables pour la gestion des états
-enum State { MANUAL, AUTOMATIC, MANUAL_ERROR, AUTOMATIC_ERROR };
-State currentState = MANUAL;
-
-// Variables pour la gestion des timings
 unsigned long lastSensorUpdate = 0;
 unsigned long lastBlinkUpdate = 0;
 const unsigned long sensorInterval = 200;  // Intervalle de lecture des capteurs (ms)
-const unsigned long blinkInterval = 500;   // Intervalle de clignotement des LEDs (ms)
-
-// Variables pour stocker les distances
-long distances[4] = {0, 0, 0, 0};
-
-// Variables pour la gestion des obstacles
+const unsigned long blinkInterval = 500;
 bool obstacleDetected = false;
 
-// Variables pour le benchmark
+
+// Variables pour le servomoteur
+const int servoPin = 5;
+Servo myServo;
+int currentAngle = 90;
+
+enum State { MANUAL, AUTOMATIC, MANUAL_ERROR, AUTOMATIC_ERROR };
+State currentState = MANUAL;
+
 unsigned long sensorReadTime = 0;
 unsigned long obstacleCheckTime = 0;
 unsigned long serialCommandTime = 0;
@@ -44,8 +38,7 @@ void setup() {
     pinMode(trigPin[i], OUTPUT);
     pinMode(echoPin[i], INPUT);
   }
-
-  // Configurer les broches des LEDs
+    // Configurer les broches des LEDs
   pinMode(GreenledPin, OUTPUT);
   pinMode(RedledPin, OUTPUT);
 
@@ -59,12 +52,10 @@ void loop() {
   if (millis() - lastSensorUpdate >= sensorInterval) {
     unsigned long startTime = micros();
     readAllSensors();
-    sensorReadTime = micros() - startTime;
     lastSensorUpdate = millis();
   }
-
-  // Gérer les LEDs en fonction de l'état actuel
-  unsigned long startTime = micros();
+    // Gérer les LEDs en fonction de l'état actuel
+    unsigned long startTime = micros();
   updateLEDs();
   ledUpdateTime = micros() - startTime;
 
@@ -77,8 +68,10 @@ void loop() {
   startTime = micros();
   handleSerialCommands();
   serialCommandTime = micros() - startTime;
+  // Détecter les obstacles
+  checkObstacles();
 
-  // Exécuter les actions en fonction de l'état
+
   switch (currentState) {
     case MANUAL:
       // Mode manuel : rien à faire ici, les commandes sont gérées par handleSerialCommands()
@@ -93,8 +86,8 @@ void loop() {
       break;
   }
 
-  // Afficher les temps d'exécution pour le benchmark
-  printBenchmark();
+
+  printDistances();
 }
 
 // Fonction pour lire tous les capteurs
@@ -116,7 +109,24 @@ long getDistance(int sensorIndex) {
   return duration * 0.034 / 2;  // Convertir en cm
 }
 
-// Fonction pour mettre à jour les LEDs
+// Fonction pour détecter les obstacles
+void checkObstacles() {
+  obstacleDetected = false;
+  for (int i = 0; i < 4; i++) {
+    if (distances[i] < 20) {
+      obstacleDetected = true;
+      break;
+    }
+  }
+    // Mettre à jour l'état en fonction de la détection d'obstacles
+  if (obstacleDetected) {
+    if (currentState == MANUAL) currentState = MANUAL_ERROR;
+    if (currentState == AUTOMATIC) currentState = AUTOMATIC_ERROR;
+  } else {
+    if (currentState == MANUAL_ERROR) currentState = MANUAL;
+    if (currentState == AUTOMATIC_ERROR) currentState = AUTOMATIC;
+  }
+}
 void updateLEDs() {
   static bool ledState = false;
   unsigned long currentMillis = millis();
@@ -141,59 +151,7 @@ void updateLEDs() {
   }
 }
 
-// Fonction pour détecter les obstacles
-void checkObstacles() {
-  obstacleDetected = false;
-  for (int i = 0; i < 4; i++) {
-    if (distances[i] < 20) {
-      obstacleDetected = true;
-      break;
-    }
-  }
-
-  // Mettre à jour l'état en fonction de la détection d'obstacles
-  if (obstacleDetected) {
-    if (currentState == MANUAL) currentState = MANUAL_ERROR;
-    if (currentState == AUTOMATIC) currentState = AUTOMATIC_ERROR;
-  } else {
-    if (currentState == MANUAL_ERROR) currentState = MANUAL;
-    if (currentState == AUTOMATIC_ERROR) currentState = AUTOMATIC;
-  }
-}
-
-// Fonction pour arrêter le rover
-void stopRover() {
-  Serial.println("Rover stopped");
-  // Implémenter l'arrêt du rover ici
-}
-
-// Fonction pour gérer les commandes série
-void handleSerialCommands() {
-  if (Serial.available()) {
-    String input = Serial.readString();
-    input.trim();  // Supprimer les espaces inutiles
-
-    if (input == "e") {
-      printDistances();
-    } else if (input == "a") {
-      toggleMode();
-    } else if (input.toInt() >= 0 && input.toInt() <= 180) {
-      setServoAngle(input.toInt());
-    }
-  }
-}
-
-// Fonction pour basculer entre les modes manuel et automatique
-void toggleMode() {
-  if (currentState == MANUAL || currentState == MANUAL_ERROR) {
-    currentState = AUTOMATIC;
-  } else {
-    currentState = MANUAL;
-  }
-  Serial.println(currentState == MANUAL ? "Mode: MANUAL" : "Mode: AUTOMATIC");
-}
-
-// Fonction pour afficher les distances
+// Fonction pour afficher les distances mesurées
 void printDistances() {
   for (int i = 0; i < 4; i++) {
     Serial.print("Capteur ");
@@ -203,33 +161,37 @@ void printDistances() {
     Serial.println(" cm");
   }
 }
+void stopRover() {
+  Serial.println("Rover stopped");
+  // Implémenter l'arrêt du rover ici
+}
 
-// Fonction pour déplacer le servomoteur
+void handleSerialCommands() {
+  if (Serial.available()) {
+    String input = Serial.readString();
+    input.trim();  // Supprimer les espaces inutiles
+
+    if  (input.toInt() >= 0 && input.toInt() <= 180) {
+      setServoAngle(input.toInt());
+    }
+
+    // AJOUTER ICI activer la fonction TOGGLEMODE
+  }
+}
+
+
+void toggleMode() {
+  if (currentState == MANUAL || currentState == MANUAL_ERROR) {
+    currentState = AUTOMATIC;
+  } else {
+    currentState = MANUAL;
+  }
+  Serial.println(currentState == MANUAL ? "Mode: MANUAL" : "Mode: AUTOMATIC");
+}
+
 void setServoAngle(int angle) {
   currentAngle = angle;
   myServo.write(currentAngle);
   Serial.print("Servo déplacé à l'angle : ");
   Serial.println(currentAngle);
-}
-
-// Fonction pour afficher les temps d'exécution
-void printBenchmark() {
-  Serial.println("=== Benchmark ===");
-  Serial.print("Lecture des capteurs: ");
-  Serial.print(sensorReadTime);
-  Serial.println(" µs");
-
-  Serial.print("Détection des obstacles: ");
-  Serial.print(obstacleCheckTime);
-  Serial.println(" µs");
-
-  Serial.print("Traitement des commandes série: ");
-  Serial.print(serialCommandTime);
-  Serial.println(" µs");
-
-  Serial.print("Mise à jour des LEDs: ");
-  Serial.print(ledUpdateTime);
-  Serial.println(" µs");
-
-  Serial.println("=================");
 }

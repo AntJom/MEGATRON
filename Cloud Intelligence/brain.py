@@ -36,7 +36,22 @@ smoothed_state = {
 # =============================================================================
 # Fonctions utilitaires d'affichage et de redimensionnement
 # =============================================================================
+
 def resize_with_aspect_ratio(image, target_width, target_height):
+    """
+    Redimensionne une image sans déformer son ratio.
+
+    Entrées:
+        image (np.ndarray): Image source.
+        target_width (int): Largeur maximale souhaitée.
+        target_height (int): Hauteur maximale souhaitée.
+
+    Sortie:
+        resized_image (np.ndarray): Image redimensionnée pour tenir dans la zone cible tout en conservant le ratio.
+
+    Cette fonction calcule les nouvelles dimensions en fonction du ratio largeur/hauteur d'origine
+    et applique un redimensionnement bilinéaire.
+    """
     h, w = image.shape[:2]
     aspect_ratio = w / h
     if target_width / target_height > aspect_ratio:
@@ -48,7 +63,22 @@ def resize_with_aspect_ratio(image, target_width, target_height):
     resized_image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
     return resized_image
 
+
 def show_in_window(window_name, image):
+    """
+    Affiche une image dans une fenêtre avec centrage et redimensionnement automatique.
+
+    Entrées:
+        window_name (str): Nom de la fenêtre OpenCV.
+        image (np.ndarray): Image à afficher.
+
+    Sortie:
+        None (affiche la fenêtre directement).
+
+    Cette fonction récupère la taille de la fenêtre, ajuste l'image via resize_with_aspect_ratio,
+    crée un canevas noir aux dimensions de la fenêtre, centre l'image redimensionnée,
+    puis utilise cv2.imshow pour l'affichage.
+    """
     try:
         x, y, win_width, win_height = cv2.getWindowImageRect(window_name)
     except Exception:
@@ -67,9 +97,18 @@ def show_in_window(window_name, image):
 # =============================================================================
 # Fonction de traitement d'angle pour le servo
 # =============================================================================
+
 def angle(input_angle):
     """
-    Réduit l'angle à l'intervalle [-33, 33] puis renvoie 90 + (angle réduit * 8/6)
+    Transforme un angle de visée en commande pour servo-moteur.
+
+    Entrée:
+        input_angle (float): Angle calculé en degrés autour de l'axe vertical.
+
+    Sortie:
+        servo_angle (float): Valeur centrée autour de 90°, bornée et mise à l'échelle pour le servo.
+
+    La fonction borne l'angle à [-33, 33] puis le convertit en plage [90 - 33*(8/6), 90 + 33*(8/6)].
     """
     clamped = max(-33, min(33, input_angle))
     return (90 + clamped * (8/6))
@@ -77,7 +116,23 @@ def angle(input_angle):
 # =============================================================================
 # Fonctions d'affichage pour le suivi (YOLO / DeepSORT)
 # =============================================================================
+
 def update_tracking_window(frame, tracks, candidate_id, tracking_confirmed):
+    """
+    Dessine les boîtes de suivi DeepSORT et indique le candidat si confirmé.
+
+    Entrées:
+        frame (np.ndarray): Image sur laquelle dessiner les boîtes.
+        tracks (list): Liste d'objets track renvoyés par DeepSort.
+        candidate_id (int | None): ID du track sélectionné comme candidat.
+        tracking_confirmed (bool): Indique si le suivi du candidat est confirmé après délai.
+
+    Sortie:
+        None (affiche la fenêtre de suivi).
+
+    Parcourt les tracks confirmés, dessine en rouge la boîte du candidat confirmé,
+    et en vert les autres personnes, puis affiche avec show_in_window.
+    """
     for track in tracks:
         if not track.is_confirmed():
             continue
@@ -93,7 +148,21 @@ def update_tracking_window(frame, tracks, candidate_id, tracking_confirmed):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     show_in_window("DeepSORT Tracking", frame)
 
+
 def update_center_ratio_window(frame, tracks):
+    """
+    Affiche le centre de chaque bbox et leur ratio hauteur/largeur.
+
+    Entrées:
+        frame (np.ndarray): Image source pour calculs de dimensions.
+        tracks (list): Liste d'objets track DeepSort.
+
+    Sortie:
+        None (affiche une fenêtre avec points et ratios).
+
+    Crée un canevas blanc de la taille de l'image, calcule centre et ratio pour chaque track,
+    dessine un cercle rouge au centre et affiche le ratio à côté.
+    """
     height, width, _ = frame.shape
     blank = 255 * np.ones((height, width, 3), dtype=np.uint8)
     for track in tracks:
@@ -110,7 +179,20 @@ def update_center_ratio_window(frame, tracks):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     show_in_window("Center & Ratio", blank)
 
+
 def update_yolo_window(frame, yolo_detections_boxes):
+    """
+    Affiche les détections YOLO sur l'image.
+
+    Entrées:
+        frame (np.ndarray): Image sur laquelle dessiner.
+        yolo_detections_boxes (list of tuples): Liste de boîtes (x1, y1, x2, y2).
+
+    Sortie:
+        None (affiche les boîtes YOLO dans une fenêtre dédiée).
+
+    Clone l'image, dessine chaque bbox en jaune avec le label "YOLO", puis affiche.
+    """
     frame_yolo = frame.copy()
     for (x1, y1, x2, y2) in yolo_detections_boxes:
         cv2.rectangle(frame_yolo, (x1, y1), (x2, y2), (0, 255, 255), 4)
@@ -118,7 +200,21 @@ def update_yolo_window(frame, yolo_detections_boxes):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     show_in_window("YOLO Detections", frame_yolo)
 
+
 def update_candidate_tracking_window_with_smoothing(frame, candidate_track):
+    """
+    Affiche la position lissée du candidat dans une fenêtre dédiée.
+
+    Entrées:
+        frame (np.ndarray): Image de référence pour les dimensions.
+        candidate_track (Track object): Objet track du candidat.
+
+    Sortie:
+        None (affiche la trajectoire lissée).
+
+    Extrait le centre du bbox du candidat, met à jour l'état lissé via update_smoothed_candidate_point,
+    puis affiche le résultat sur un canevas blanc.
+    """
     blank = 255 * np.ones_like(frame, dtype=np.uint8)
     x1, y1, x2, y2 = map(int, candidate_track.to_ltrb())
     center_x = int((x1 + x2) / 2)
@@ -127,7 +223,22 @@ def update_candidate_tracking_window_with_smoothing(frame, candidate_track):
     update_smoothed_candidate_point(blank, (center_x, center_y))
     show_in_window("Candidate Tracking", blank)
 
+
 def update_smoothed_candidate_point(frame, target_center):
+    """
+    Calcule et trace la position lissée du point cible avec envoi au servo.
+
+    Entrées:
+        frame (np.ndarray): Canevas sur lequel dessiner.
+        target_center (tuple): Coordonnées (x, y) du point à lisser.
+
+    Sortie:
+        None (dessine sur frame et envoie angle si nécessaire).
+
+    Implémente un modèle de masse-ressort avec friction pour lisser le mouvement,
+    trace l'ancien et nouveau vecteur, calcule l'angle pour le servo,
+    et envoie la commande via port série si >1s depuis dernier envoi.
+    """
     global smoothed_state, ser, last_com_send_time
     attraction = 0.02
     friction = 0.85
@@ -205,11 +316,21 @@ def update_smoothed_candidate_point(frame, target_center):
 # =============================================================================
 # Calibration via une image de référence (Mediapipe)
 # =============================================================================
+
 def calibrate_from_reference(ref_image_path, known_height_cm, known_distance_cm):
     """
-    Calibre la caméra à partir d'une image de référence.
-    On utilise l'envergure (distance entre les poignets) pour calculer la focale effective
-    via le modèle pinhole.
+    Calibre la caméra à partir d'une image de référence en calculant la focale.
+
+    Entrées:
+        ref_image_path (str): Chemin vers l'image de référence contenant une pose humaine.
+        known_height_cm (float): Hauteur réelle de la personne en cm (envergure bras étendus).
+        known_distance_cm (float): Distance de la personne à la caméra en cm.
+
+    Sortie:
+        focal_length (float | None): Focale effective calculée en pixels, ou None si échec.
+
+    Utilise Mediapipe pour détecter la pose, extrait la distance pixel entre poignets,
+    puis applique le modèle du trou de serrure (pinhole) pour estimer la focale.
     """
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5)

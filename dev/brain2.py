@@ -5,279 +5,298 @@ import math
 import numpy as np
 import time
 import datetime
-from dataclasses import dataclass
-from enum import Enum
-from typing import Tuple, List, Dict, Optional
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 # ——————————————————————————————————
-# INDICES & RANSAC
+# CONFIGURATION (globals)
 # ——————————————————————————————————
-JOINT_INDICES = (7, 9, 8, 10)  # épaules + poignets
+MODEL_PATH = 'yolo11x-pose.pt'
+CALIB_DIR = 'calib_data'
 
-def score_ransac(xy: np.ndarray, conf: np.ndarray, thresh_deg: float) -> float:
-    pts = [tuple(xy[i]) for i in JOINT_INDICES if conf[i] > 0.2]
-    if len(pts) < 2:
-        return 0.0
-    best = 0
-    for i in range(len(pts)):
-        for j in range(i+1, len(pts)):
-            p1, p2 = pts[i], pts[j]
-            angle = abs(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])))
-            angle = min(angle, 180 - angle)
-            if angle > thresh_deg:
-                continue
-            inliers = sum(
-                min(
-                    abs(math.degrees(math.atan2(p[1]-p1[1], p[0]-p1[0]))),
-                    180 - abs(math.degrees(math.atan2(p[1]-p1[1], p[0]-p1[0])))
-                ) <= thresh_deg
-                for p in pts
-            )
-            best = max(best, inliers)
-    return 100.0 * best / len(pts)
+DRAW_SKELETON = True
+DRAW_BOXES = True
+DISPLAY_PROCESS_TIME = False
 
-@dataclass
-class Config:
-    model_path: str = 'yolo11x-pose.pt'
-    calib_dir: str = 'calib_data'
-    draw_skeleton: bool = True
-    draw_boxes: bool = True
-    display_process_time: bool = True
-    horizontal_threshold_deg: float = 15.0
-    score_ok: float = 80.0
-    deepsort_max_age: int = 50
-    deepsort_n_init: int = 10
-    deepsort_nms_max_overlap: float = 0.3
-    deepsort_max_iou_distance: float = 0.9
-    deepsort_max_cosine_distance: float = 0.6
-    iou_mapping_threshold: float = 0.5
-    smooth_attraction: float = 0.02
-    smooth_friction: float = 0.85
-    smooth_threshold: float = 2.0
-    config_hold_sec: float = 5.0
-    config_frame_gap: float = 0.5
-    config_margin_px: int = 50
+HORIZONTAL_THRESHOLD_DEG = 15.0
+SCORE_OK = 80.0
 
-class Mode(Enum):
-    MANUAL = 'manual'
-    AUTO   = 'auto'
-    CONFIG = 'config'
+DEEPSORT_MAX_AGE = 50
+DEEPSORT_N_INIT = 10
+DEEPSORT_NMS_MAX_OVERLAP = 0.3
+DEEPSORT_MAX_IOU_DISTANCE = 0.9
+DEEPSORT_MAX_COSINE_DISTANCE = 0.6
+IOU_MAPPING_THRESHOLD = 0.5
 
-class CameraHandler:
-    def __init__(self, source: int = 0, buffer_size: int = 1):
-        self.cap = cv2.VideoCapture(source)
-        if not self.cap.isOpened(): sys.exit(f"Impossible d'ouvrir le flux vidéo: {source}")
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        return self.cap.read()
-    def release(self) -> None:
-        self.cap.release()
+HOLD_TIME = 5.0
+FRAME_GAP = 0.5
+MARGIN_PX = 50
 
-class YOLOHandler:
-    def __init__(self, model_path: str):
-        self.model = YOLO(model_path)
-    def infer(self, frame: np.ndarray):
-        res = self.model(frame, verbose=False)[0]
-        if res.keypoints is None or not res.boxes:
-            return res, np.zeros((0,17,2)), np.zeros((0,17)), np.zeros((0,4),int), np.array([])
-        xy    = res.keypoints.xy.cpu().numpy()
-        conf  = res.keypoints.conf.cpu().numpy()
-        boxes = res.boxes.xyxy.cpu().numpy().astype(int)
-        confs = res.boxes.conf.cpu().numpy() if hasattr(res.boxes,'conf') else np.ones(len(boxes))
-        return res, xy, conf, boxes, confs
+# Global state
+times = {'start': None, 'last': None, 'prev_frame': None}
+state = {'mode': 'manual', 'auto_phase': 'search', 'selected_id': None}
 
-class TPoseDurationChecker:
-    def __init__(self, hold_time: float, max_gap: float):
-        self.hold_time = hold_time
-        self.max_gap = max_gap
-        self.start_time: Optional[float] = None
-        self.last_time: Optional[float] = None
-    def update(self, is_tpose: bool) -> bool:
-        now = time.time()
-        if not is_tpose:
-            self.start_time = None
-            self.last_time = None
-            return False
-        if self.last_time and now - self.last_time > self.max_gap:
-            self.start_time = now
-        if self.start_time is None:
-            self.start_time = now
-        self.last_time = now
-        return (now - self.start_time) >= self.hold_time
+cap = None
+model = None
+tracker = None
+calibration_images = []
+focal_length = 0.0
+ref_span_cm = 0.0
 
-class DeepSortHandler:
-    def __init__(self, cfg: Config):
-        self.tracker = DeepSort(
-            max_age=cfg.deepsort_max_age,
-            n_init=cfg.deepsort_n_init,
-            nms_max_overlap=cfg.deepsort_nms_max_overlap,
-            max_iou_distance=cfg.deepsort_max_iou_distance,
-            max_cosine_distance=cfg.deepsort_max_cosine_distance
-        )
-    def update(self, boxes: np.ndarray, confs: np.ndarray, frame: np.ndarray):
-        dets = [([int(x1),int(y1),int(x2-x1),int(y2-y1)], float(c), 'person')
-                for (x1,y1,x2,y2), c in zip(boxes, confs)]
-        return self.tracker.update_tracks(dets, frame=frame)
+JOINT_INDICES = (7, 9, 8, 10)
 
-class AngleCalculator:
-    @staticmethod
-    def compute(p1: Tuple[int,int], p2: Tuple[int,int]) -> float:
-        dx, dy = p2[0]-p1[0], p2[1]-p1[1]
-        return abs(np.degrees(np.arctan2(dy, dx)))
-    @staticmethod
-    def annotate(frame: np.ndarray, center: Tuple[int,int]):
-        h, w = frame.shape[:2]
-        ref = (w//2, h)
-        cv2.line(frame, ref, center, (255,0,255), 2)
-        ang = AngleCalculator.compute(center, ref)
-        cv2.putText(frame, f"{ang:.1f}°", (ref[0]+10, ref[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,255),2)
-        return ang
+# ——————————————————————————————————
+# INITIALIZATION
+# ——————————————————————————————————
+def init_camera(source=0, buffer_size=1):
+    global cap
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        sys.exit(f"Impossible d'ouvrir le flux vidéo: {source}")
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
 
-class CalibrationHandler:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        os.makedirs(cfg.calib_dir, exist_ok=True)
-        self.calibs = self._load_calibrations()
-        self.focal_length, self.ref_span_cm = self._compute_focal_and_refspan()
-    def _load_calibrations(self) -> List[Dict]:
-        out = []
-        for fn in os.listdir(self.cfg.calib_dir):
-            if not fn.lower().endswith('.jpg'): continue
+def init_model():
+    global model
+    model = YOLO(MODEL_PATH)
+
+def init_tracker():
+    global tracker
+    tracker = DeepSort(
+        max_age=DEEPSORT_MAX_AGE,
+        n_init=DEEPSORT_N_INIT,
+        nms_max_overlap=DEEPSORT_NMS_MAX_OVERLAP,
+        max_iou_distance=DEEPSORT_MAX_IOU_DISTANCE,
+        max_cosine_distance=DEEPSORT_MAX_COSINE_DISTANCE
+    )
+
+def load_calibration():
+    global calibration_images
+    os.makedirs(CALIB_DIR, exist_ok=True)
+    calibration_images = []
+    for fn in os.listdir(CALIB_DIR):
+        if fn.lower().endswith('.jpg'):
             parts = fn[:-4].split('_')
-            if len(parts) != 3: continue
-            _, sc, dc = parts
-            try:
-                span_cm = float(sc.replace('cm',''))
-                dist_cm = float(dc.replace('cm',''))
-            except ValueError:
-                continue
-            out.append({'path': os.path.join(self.cfg.calib_dir,fn),'span_cm':span_cm,'dist_cm':dist_cm})
-        return out
-    def _get_pixel_span(self,path:str)->Optional[float]:
-        img=cv2.imread(path)
-        if img is None: return None
-        yolo=YOLOHandler(self.cfg.model_path)
-        _, xy, conf, _, _ = yolo.infer(img)
-        spans=[]
-        for pts, cf in zip(xy, conf):
-            if cf[9]>0.2 and cf[10]>0.2:
-                spans.append(np.hypot(pts[10][0]-pts[9][0],pts[10][1]-pts[9][1]))
-        return max(spans) if spans else None
-    def _compute_focal_and_refspan(self)->Tuple[float,float]:
-        fs, ss = [], []
-        for c in self.calibs:
-            px=self._get_pixel_span(c['path'])
-            if px and px>1e-3:
-                fs.append(px * c['dist_cm']/c['span_cm']); ss.append(c['span_cm'])
-        if not fs: return 0.0,0.0
-        med = np.median(fs)
-        filtered=[(fs[i],ss[i]) for i,v in enumerate(fs) if abs(v-med)/med<0.3]
-        if filtered:
-            fs_f, ss_f = zip(*filtered)
-            return float(np.mean(fs_f)), float(np.mean(ss_f))
-        return med, float(np.median(ss))
+            if len(parts) == 3:
+                _, sc, dc = parts
+                try:
+                    span = float(sc.replace('cm',''))
+                    dist = float(dc.replace('cm',''))
+                except:
+                    continue
+                calibration_images.append((os.path.join(CALIB_DIR, fn), span, dist))
 
-class DistanceEstimator:
-    def __init__(self,calib:CalibrationHandler):
-        self.focal=calib.focal_length; self.ref_span=calib.ref_span_cm
-    def estimate(self,xy:np.ndarray,conf:np.ndarray)->Optional[float]:
-        spans=[np.hypot(pts[10][0]-pts[9][0],pts[10][1]-pts[9][1]) for pts,cf in zip(xy,conf) if cf[9]>0.2 and cf[10]>0.2]
-        if not spans or self.focal<=0: return None
-        return float(self.focal*self.ref_span/max(spans))
-
-class TPoseApp:
-    def __init__(self,cfg:Config):
-        self.cfg=cfg
-        self.camera=CameraHandler(0)
-        self.inferer=YOLOHandler(cfg.model_path)
-        self.ds=DeepSortHandler(cfg)
-        self.pose_checker=TPoseDurationChecker(cfg.config_hold_sec,cfg.config_frame_gap)
-        self.calib=CalibrationHandler(cfg)
-        self.dist_est=DistanceEstimator(self.calib)
-        self.mode=Mode.MANUAL
-        self.auto_phase='search'
-        self.selected_id=None
-
-    def run(self):
-        win='T-pose Detector'
-        cv2.namedWindow(win,cv2.WINDOW_NORMAL)
-        while True:
-            start=time.perf_counter()
-            ret,frame=self.camera.read()
-            if not ret: break
-            key=cv2.waitKey(1)&0xFF
-            if key==ord('m'): self.mode=Mode.MANUAL
-            elif key==ord('a'): self.mode=Mode.AUTO; self.auto_phase='search'; self.pose_checker=TPoseDurationChecker(self.cfg.config_hold_sec,self.cfg.config_frame_gap)
-            elif key==ord('c'): self.mode=Mode.CONFIG
-            elif key in (ord('q'),27): break
-
-            if self.mode==Mode.CONFIG:
-                res,xy,conf,boxes,confs=self.inferer.infer(frame)
-                if self.pose_checker.update(score_ransac(xy[0],conf[0],self.cfg.horizontal_threshold_deg)>=self.cfg.score_ok if len(xy)>0 else False):
-                    self._do_calibration(frame,xy,conf,boxes)
-                img=res.plot() if self.cfg.draw_skeleton else frame
-                cv2.imshow(win,img)
-
-            elif self.mode==Mode.MANUAL:
-                disp=frame.copy(); cv2.putText(disp,'MODE MANUEL',(20,40),cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,255),2); cv2.imshow(win,disp)
-
-            else:
-                res,xy,conf,boxes,confs=self.inferer.infer(frame)
-                if self.auto_phase=='search':
-                    img=res.plot() if self.cfg.draw_skeleton else frame.copy()
-                    for i,box in enumerate(boxes):
-                        score=score_ransac(xy[i],conf[i],self.cfg.horizontal_threshold_deg)
-                        color=(0,255,0) if score>=self.cfg.score_ok else (0,255,255)
-                        x1,y1,x2,y2=box; cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
-                    cv2.imshow(win,img)
-                    if self.pose_checker.update(any(score_ransac(xy[j],conf[j],self.cfg.horizontal_threshold_deg)>=self.cfg.score_ok for j in range(len(boxes)))):
-                        tracks=self.ds.update(boxes,confs,frame)
-                        self.selected_id=self._select_tpose_target(tracks,boxes,xy,conf)
-                        if self.selected_id: self.auto_phase='track'
-                else:
-                    tracks=self.ds.update(boxes,confs,frame)
-                    ann=frame.copy()
-                    for t in tracks:
-                        if t.is_confirmed() and t.track_id==self.selected_id:
-                            x1,y1,x2,y2=map(int,t.to_ltrb())
-                            cv2.rectangle(ann,(x1,y1),(x2,y2),(255,0,0),2)
-                            # affiche distance
-                            dist=self.dist_est.estimate(xy,conf)
-                            if dist: cv2.putText(ann,f"{dist:.1f} cm",(x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,0),2)
-                            # affiche angle de centre lissé
-                            cx,cy=(x1+x2)//2,(y1+y2)//2
-                            AngleCalculator.annotate(ann,(cx,cy))
-                            break
-                    cv2.imshow(win,ann)
-                    if not any(t.track_id==self.selected_id and t.is_confirmed() for t in tracks):
-                        self.auto_phase='search'; self.pose_checker=TPoseDurationChecker(self.cfg.config_hold_sec,self.cfg.config_frame_gap); self.selected_id=None
-
-            if self.cfg.display_process_time:
-                print(f"[{self.mode.value.upper()}:{self.auto_phase if self.mode==Mode.AUTO else ''}] {(time.perf_counter()-start)*1000:.1f} ms")
-
-        self.camera.release(); cv2.destroyAllWindows()
-
-    def _do_calibration(self, frame, xy, conf, boxes):
-        ts=datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
-        xl,yl=xy[0][9]; xr,yr=xy[0][10]
-        span_cm=float(input('Envergure (cm): '))
-        dist_cm=float(input('Distance (cm): '))
-        ann=frame.copy(); cv2.circle(ann,(int(xl),int(yl)),6,(0,0,255),-1); cv2.circle(ann,(int(xr),int(yr)),6,(0,0,255),-1)
-        cv2.putText(ann,f"{ts} | {span_cm:.0f}cm | {dist_cm:.0f}cm",(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(255,255,255),2)
-        fname=f"{ts}_{int(span_cm)}cm_{int(dist_cm)}cm.jpg"; path=os.path.join(self.cfg.calib_dir,fname); cv2.imwrite(path,ann); print(f"Saved calibration: {path}")
-
-    def _select_tpose_target(self, tracks, boxes, xy, conf)->Optional[int]:
-        for t in tracks:
-            if not t.is_confirmed(): continue
-            tb=tuple(map(int,t.to_ltrb())); ious=np.array([self._iou(tb,b) for b in boxes])
-            if ious.size==0 or ious.max()<self.cfg.iou_mapping_threshold: continue
-            return t.track_id
+def compute_pixel_span(path):
+    img = cv2.imread(path)
+    if img is None:
         return None
+    _, xy, conf, _, _ = infer_pose(img)
+    spans = [np.hypot(pts[10][0]-pts[9][0], pts[10][1]-pts[9][1])
+             for pts, cf in zip(xy, conf) if cf[9]>0.2 and cf[10]>0.2]
+    return max(spans) if spans else None
 
-    @staticmethod
-    def _iou(boxA,boxB): xA,yA=max(boxA[0],boxB[0]),max(boxA[1],boxB[1]); xB,yB=min(boxA[2],boxB[2]),min(boxA[3],boxB[3]); inter=max(0,xB-xA)*max(0,yB-yA); areaA=(boxA[2]-boxA[0])*(boxA[3]-boxA[1]); areaB=(boxB[2]-boxB[0])*(boxB[3]-boxB[1]); return inter/(areaA+areaB-inter) if (areaA+areaB-inter)>0 else 0.0
+def init_calibration():
+    global focal_length, ref_span_cm
+    load_calibration()
+    f_vals, spans = [], []
+    for path, span_cm, dist_cm in calibration_images:
+        px = compute_pixel_span(path)
+        if px and px>1e-3:
+            f_vals.append(px * dist_cm / span_cm)
+            spans.append(span_cm)
+    if not f_vals:
+        focal_length, ref_span_cm = 0.0, 0.0
+    else:
+        median_f = np.median(f_vals)
+        filt = [(f_vals[i], spans[i]) for i in range(len(f_vals)) if abs(f_vals[i]-median_f)/median_f<0.3]
+        if filt:
+            fs, ss = zip(*filt)
+            focal_length, ref_span_cm = float(np.mean(fs)), float(np.mean(ss))
+        else:
+            focal_length, ref_span_cm = float(median_f), float(np.median(spans))
+
+# ——————————————————————————————————
+# PROCESSING FUNCTIONS
+# ——————————————————————————————————
+def read_frame():
+    return cap.read()
+
+def infer_pose(frame):
+    res = model(frame, verbose=False)[0]
+    if res.keypoints is None or not res.boxes:
+        return res, np.zeros((0,17,2)), np.zeros((0,17)), np.zeros((0,4),int), np.array([])
+    xy = res.keypoints.xy.cpu().numpy()
+    conf = res.keypoints.conf.cpu().numpy()
+    boxes = res.boxes.xyxy.cpu().numpy().astype(int)
+    confs = res.boxes.conf.cpu().numpy() if hasattr(res.boxes,'conf') else np.ones(len(boxes))
+    return res, xy, conf, boxes, confs
+
+def score_ransac(xy, conf, thresh_deg):
+    pts = [tuple(xy[i]) for i in JOINT_INDICES if conf[i]>0.2]
+    if len(pts)<2: return 0.0
+    best=0
+    for i in range(len(pts)):
+        for j in range(i+1,len(pts)):
+            p1,p2=pts[i],pts[j]
+            ang=abs(math.degrees(math.atan2(p2[1]-p1[1],p2[0]-p1[0])))
+            ang=min(ang,180-ang)
+            if ang>thresh_deg: continue
+            inl=sum(min(abs(math.degrees(math.atan2(p[1]-p1[1],p[0]-p1[0]))),
+                       180-abs(math.degrees(math.atan2(p[1]-p1[1],p[0]-p1[0]))))<=thresh_deg
+                    for p in pts)
+            best=max(best,inl)
+    return 100.0*best/len(pts)
+
+def update_duration(is_tpose):
+    now=time.time()
+    if not is_tpose:
+        times['start']=times['last']=None
+        return False
+    if times['last'] and now-times['last']>FRAME_GAP:
+        times['start']=now
+    if not times['start']:
+        times['start']=now
+    times['last']=now
+    return (now-times['start'])>=HOLD_TIME
+
+def update_tracker(boxes, confs, frame):
+    dets=[([int(x1),int(y1),int(x2-x1),int(y2-y1)], float(c), 'person')
+          for (x1,y1,x2,y2),c in zip(boxes,confs)]
+    return tracker.update_tracks(dets, frame=frame)
+
+def compute_angle(p1, p2):
+    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+    return abs(np.degrees(np.arctan2(dy, dx)))
+
+def annotate_angle(frame, center):
+    h,w=frame.shape[:2]
+    ref=(w//2,h)
+    cv2.line(frame, ref, center, (255,0,255),2)
+    ang=compute_angle(center, ref)
+    cv2.putText(frame, f"{ang:.1f}°", (ref[0]+10,ref[1]-10), cv2.FONT_HERSHEY_SIMPLEX,0.8,(255,0,255),2)
+    return ang
+
+def estimate_distance(xy, conf):
+    spans=[np.hypot(pts[10][0]-pts[9][0],pts[10][1]-pts[9][1])
+           for pts,cf in zip(xy,conf) if cf[9]>0.2 and cf[10]>0.2]
+    if not spans or focal_length<=0:
+        return None
+    return float(focal_length*ref_span_cm/max(spans))
+
+def select_tpose_target(tracks, boxes, xy, conf):
+    for t in tracks:
+        if not t.is_confirmed(): continue
+        tb=tuple(map(int,t.to_ltrb()))
+        ious=np.array([iou(tb,b) for b in boxes])
+        if ious.size==0 or ious.max()<IOU_MAPPING_THRESHOLD: continue
+        return t.track_id
+    return None
+
+def iou(boxA, boxB):
+    xA,yA=max(boxA[0],boxB[0]),max(boxA[1],boxB[1])
+    xB,yB=min(boxA[2],boxB[2]),min(boxA[3],boxB[3])
+    inter=max(0,xB-xA)*max(0,yB-yA)
+    aA=(boxA[2]-boxA[0])*(boxA[3]-boxA[1])
+    aB=(boxB[2]-boxB[0])*(boxB[3]-boxB[1])
+    return inter/(aA+aB-inter) if (aA+aB-inter)>0 else 0.0
+
+# Calibration helper (replaces missing calibrate_step)
+
+
+# Ajouter avant run()
+def calibrate_step(frame, xy, conf, boxes):
+    """Effectue une étape de calibration en mode CONFIG"""
+    ts = datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+    xl, yl = int(xy[0][9][0]), int(xy[0][9][1])
+    xr, yr = int(xy[0][10][0]), int(xy[0][10][1])
+    span_cm = float(input('Envergure (cm): '))
+    dist_cm = float(input('Distance (cm): '))
+    ann = frame.copy()
+    fname = f"{ts}_{int(span_cm)}cm_{int(dist_cm)}cm.jpg"
+    path = os.path.join(CALIB_DIR, fname)
+    cv2.imwrite(path, ann)
+    print(f"Saved calibration: {path}")
+
+
+# ——————————————————————————————————
+# MAIN LOOP
+# ——————————————————————————————————
+def run():
+    global cap, tracker, state, times
+    win = 'T-pose Detector'
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    init_camera()
+    init_model()
+    init_tracker()
+    init_calibration()
+    times['prev_frame'] = time.perf_counter()
+
+    while True:
+        now = time.perf_counter()
+        ret, frame = read_frame()
+        if not ret: break
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('m'):
+            state['mode'] = 'manual'
+        elif key == ord('a'):
+            state['mode'] = 'auto'
+            state['auto_phase'] = 'search'
+            times['start'] = times['last'] = None
+        elif key == ord('c'):
+            state['mode'] = 'config'
+        elif key in (ord('q'), 27):
+            break
+
+        if state['mode'] in ('config', 'auto'):
+            res, xy, conf, boxes, confs = infer_pose(frame)
+        if state['mode'] == 'config':
+            if update_duration(score_ransac(xy[0], conf[0], HORIZONTAL_THRESHOLD_DEG) >= SCORE_OK if len(xy)>0 else False):
+                calibrate_step(frame, xy, conf, boxes)
+            img = res.plot() if DRAW_SKELETON else frame
+            cv2.imshow(win, img)
+
+        elif state['mode'] == 'manual':
+            disp = frame.copy()
+            cv2.putText(disp, 'MODE MANUEL', (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255),2)
+            cv2.imshow(win, disp)
+
+        else:  # auto
+            if state['auto_phase'] == 'search':
+                img = res.plot() if DRAW_SKELETON else frame.copy()
+                for i, box in enumerate(boxes):
+                    sc = score_ransac(xy[i], conf[i], HORIZONTAL_THRESHOLD_DEG)
+                    color = (0,255,0) if sc>=SCORE_OK else (0,255,255)
+                    x1,y1,x2,y2 = box
+                    cv2.rectangle(img, (x1,y1), (x2,y2), color,2)
+                cv2.imshow(win, img)
+                if update_duration(any(score_ransac(xy[j], conf[j], HORIZONTAL_THRESHOLD_DEG)>=SCORE_OK for j in range(len(boxes)))):
+                    tracks = update_tracker(boxes, confs, frame)
+                    state['selected_id'] = select_tpose_target(tracks, boxes, xy, conf)
+                    if state['selected_id']:
+                        state['auto_phase'] = 'track'
+            else:
+                tracks = update_tracker(boxes, confs, frame)
+                ann = frame.copy()
+                for t in tracks:
+                    if t.is_confirmed() and t.track_id==state['selected_id']:
+                        x1,y1,x2,y2 = map(int, t.to_ltrb())
+                        cv2.rectangle(ann,(x1,y1),(x2,y2),(255,0,0),2)
+                        dist = estimate_distance(xy, conf)
+                        if dist:
+                            cv2.putText(ann, f"{dist:.1f} cm", (x1,y1-10), cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,0),2)
+                        cx,cy=(x1+x2)//2,(y1+y2)//2
+                        annotate_angle(ann,(cx,cy))
+                        break
+                cv2.imshow(win, ann)
+                if not any(t.track_id==state['selected_id'] and t.is_confirmed() for t in tracks):
+                    state['auto_phase']='search'
+                    times['start']=times['last']=None
+                    state['selected_id']=None
+
+        if DISPLAY_PROCESS_TIME:
+            print(f"[{state['mode'].upper()}:{state.get('auto_phase','')}] {(time.perf_counter()-now)*1000:.1f} ms")
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__=='__main__':
-    cfg=Config(); app=TPoseApp(cfg); app.run()
+    run()

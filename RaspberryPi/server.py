@@ -16,9 +16,9 @@ HEADER_FMT = "Q"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 PRESETS = {
-    "HIGH":   {"quality": 90, "use_gray": False, "resize_factor": 0.25},
-    "MEDIUM": {"quality": 60, "use_gray": False, "resize_factor": 0.25},
-    "LOW":    {"quality": 30, "use_gray": True,  "resize_factor": 0.25},
+    "HIGH":   {"quality": 100, "use_gray": False, "resize_factor": 0.5},
+    "MEDIUM": {"quality": 60, "use_gray": False, "resize_factor": 0.5},
+    "LOW":    {"quality": 30, "use_gray": False,  "resize_factor": 0.5},
 }
 PRESET_LIST = list(PRESETS.keys())
 DEFAULT_PRESET = "HIGH"

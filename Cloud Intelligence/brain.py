@@ -1,578 +1,464 @@
+import os
+import sys
 import cv2
+import math
 import numpy as np
 import time
-import serial
-import math
-from deep_sort_realtime.deepsort_tracker import DeepSort
+import datetime
 from ultralytics import YOLO
-import mediapipe as mp
+from deep_sort_realtime.deepsort_tracker import DeepSort
+import re
+import glob
 
-# =============================================================================
-# Paramètres d'affichage
-# =============================================================================
-window_sizes = {
-    "DeepSORT Tracking": (768, 432),
-    "Center & Ratio": (768, 432),
-    "YOLO Detections": (768, 432),
-    "Candidate Tracking": (768, 432)
+# Import du client de streaming
+from eye import init_stream, read_stream_frame, send_control, close_stream
+
+# ——————————————————————————————————
+# CONFIGURATION (globals)
+# ——————————————————————————————————
+MODEL_PATH = 'yolo11x-pose.pt'
+CALIB_DIR = 'calib_data'
+
+DRAW_SKELETON = True
+DRAW_BOXES = True
+DISPLAY_PROCESS_TIME = False
+
+HORIZONTAL_THRESHOLD_DEG = 15.0
+SCORE_OK = 80.0
+
+DEEPSORT_MAX_AGE = 50
+DEEPSORT_N_INIT = 10
+DEEPSORT_NMS_MAX_OVERLAP = 0.3
+DEEPSORT_MAX_IOU_DISTANCE = 0.9
+DEEPSORT_MAX_COSINE_DISTANCE = 0.6
+IOU_MAPPING_THRESHOLD = 0.5
+
+HOLD_TIME = 5.0
+FRAME_GAP = 0.5
+MARGIN_PX = 50
+
+# Anthropometric constants (pour calibration future)
+REAL_HEIGHT_CM   = 175.0       # taille du sujet pour la calibration
+DIST_CORRECTION  = 1.0         # facteur de correction global si besoin
+REAL_DIST_CM     = 200.0       # distance caméra–sujet lors de la calibration
+REAL_SPAN_CM     = REAL_HEIGHT_CM * 7.0/9.0  # envergure poignet→poignet de référence
+
+PROPORTIONS = {
+    'shoulder_shoulder':       0.26,
+    'left_shoulder_elbow':     0.186,
+    'left_elbow_wrist':        0.146,
+    'right_shoulder_elbow':    0.186,
+    'right_elbow_wrist':       0.146
+}
+REAL_SEGMENTS = {
+    **{k: PROPORTIONS[k] * REAL_HEIGHT_CM for k in PROPORTIONS},
+    'span_wrist_wrist': REAL_SPAN_CM
 }
 
-# =============================================================================
-# Variables globales
-# =============================================================================
-last_com_send_time = 0
-candidate_id = None         
-candidate_start_time = 0    
-tracking_confirmed = False  
+# COCO keypoint indices
+NOSE, LEYE, REYE, LEAR, REAR = 0, 1, 2, 3, 4
+LSH, RSH = 5, 6
+LEL, REL = 7, 8
+LWR, RWR = 9, 10
+LHIP, RHIP = 11, 12
+LKNE, RKNE = 13, 14
+LANK, RANK = 15, 16
+CONF_THRESH = 0.2
 
-smoothed_state = {
-    "x": 0,
-    "y": 0,
-    "vx": 0,
-    "vy": 0,
-    "initialized": False
-}
+# Joint indices for RANSAC shoulders + wrists
+JOINT_INDICES = (7, 9, 8, 10)
 
-# =============================================================================
-# Fonctions utilitaires d'affichage et de redimensionnement
-# =============================================================================
+# Global state
+times = {'start': None, 'last': None, 'prev_frame': None}
+state = {'mode': 'manual', 'auto_phase': 'search', 'selected_id': None}
 
-def resize_with_aspect_ratio(image, target_width, target_height):
-    """
-    Redimensionne une image sans déformer son ratio.
+cap = None
+model = None
+tracker = None
 
-    Entrées:
-        image (np.ndarray): Image source.
-        target_width (int): Largeur maximale souhaitée.
-        target_height (int): Hauteur maximale souhaitée.
+# Basculer entre webcam (False) et streaming réseau (True)
+USE_STREAM = True
 
-    Sortie:
-        resized_image (np.ndarray): Image redimensionnée pour tenir dans la zone cible tout en conservant le ratio.
-
-    Cette fonction calcule les nouvelles dimensions en fonction du ratio largeur/hauteur d'origine
-    et applique un redimensionnement bilinéaire.
-    """
-    h, w = image.shape[:2]
-    aspect_ratio = w / h
-    if target_width / target_height > aspect_ratio:
-        new_height = target_height
-        new_width = int(target_height * aspect_ratio)
+# ——————————————————————————————————
+# INITIALIZATION
+# ——————————————————————————————————
+def init_camera(source=0, buffer_size=1):
+    global cap
+    if USE_STREAM:
+        init_stream()    # initialise le socket de streaming
+        cap = None
     else:
-        new_width = target_width
-        new_height = int(target_width / aspect_ratio)
-    resized_image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-    return resized_image
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            sys.exit(f"Impossible d'ouvrir le flux vidéo: {source}")
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
 
+def init_model():
+    global model
+    model = YOLO(MODEL_PATH)
 
-def show_in_window(window_name, image):
-    """
-    Affiche une image dans une fenêtre avec centrage et redimensionnement automatique.
+def init_tracker():
+    global tracker
+    tracker = DeepSort(
+        max_age=DEEPSORT_MAX_AGE,
+        n_init=DEEPSORT_N_INIT,
+        nms_max_overlap=DEEPSORT_NMS_MAX_OVERLAP,
+        max_iou_distance=DEEPSORT_MAX_IOU_DISTANCE,
+        max_cosine_distance=DEEPSORT_MAX_COSINE_DISTANCE
+    )
 
-    Entrées:
-        window_name (str): Nom de la fenêtre OpenCV.
-        image (np.ndarray): Image à afficher.
-
-    Sortie:
-        None (affiche la fenêtre directement).
-
-    Cette fonction récupère la taille de la fenêtre, ajuste l'image via resize_with_aspect_ratio,
-    crée un canevas noir aux dimensions de la fenêtre, centre l'image redimensionnée,
-    puis utilise cv2.imshow pour l'affichage.
-    """
-    try:
-        x, y, win_width, win_height = cv2.getWindowImageRect(window_name)
-    except Exception:
-        win_width, win_height = window_sizes.get(window_name, (768, 432))
-    def_width, def_height = window_sizes.get(window_name, (768, 432))
-    if win_width < def_width or win_height < def_height:
-        win_width, win_height = def_width, def_height
-    resized_image = resize_with_aspect_ratio(image, win_width, win_height)
-    canvas = np.zeros((win_height, win_width, 3), dtype=np.uint8)
-    h_new, w_new = resized_image.shape[:2]
-    x_offset = (win_width - w_new) // 2
-    y_offset = (win_height - h_new) // 2
-    canvas[y_offset:y_offset+h_new, x_offset:x_offset+w_new] = resized_image
-    cv2.imshow(window_name, canvas)
-
-# =============================================================================
-# Fonction de traitement d'angle pour le servo
-# =============================================================================
-
-def angle(input_angle):
-    """
-    Transforme un angle de visée en commande pour servo-moteur.
-
-    Entrée:
-        input_angle (float): Angle calculé en degrés autour de l'axe vertical.
-
-    Sortie:
-        servo_angle (float): Valeur centrée autour de 90°, bornée et mise à l'échelle pour le servo.
-
-    La fonction borne l'angle à [-33, 33] puis le convertit en plage [90 - 33*(8/6), 90 + 33*(8/6)].
-    """
-    clamped = max(-33, min(33, input_angle))
-    return (90 + clamped * (8/6))
-
-# =============================================================================
-# Fonctions d'affichage pour le suivi (YOLO / DeepSORT)
-# =============================================================================
-
-def update_tracking_window(frame, tracks, candidate_id, tracking_confirmed):
-    """
-    Dessine les boîtes de suivi DeepSORT et indique le candidat si confirmé.
-
-    Entrées:
-        frame (np.ndarray): Image sur laquelle dessiner les boîtes.
-        tracks (list): Liste d'objets track renvoyés par DeepSort.
-        candidate_id (int | None): ID du track sélectionné comme candidat.
-        tracking_confirmed (bool): Indique si le suivi du candidat est confirmé après délai.
-
-    Sortie:
-        None (affiche la fenêtre de suivi).
-
-    Parcourt les tracks confirmés, dessine en rouge la boîte du candidat confirmé,
-    et en vert les autres personnes, puis affiche avec show_in_window.
-    """
-    for track in tracks:
-        if not track.is_confirmed():
-            continue
-        track_id = track.track_id
-        x1, y1, x2, y2 = map(int, track.to_ltrb())
-        if candidate_id is not None and track_id == candidate_id and tracking_confirmed:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
-            cv2.putText(frame, f"Tracking Candidate (ID {track_id})", (x1, y1 - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        else:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 4)
-            cv2.putText(frame, f"person ID {track_id}", (x1, y1 - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    show_in_window("DeepSORT Tracking", frame)
-
-
-def update_center_ratio_window(frame, tracks):
-    """
-    Affiche le centre de chaque bbox et leur ratio hauteur/largeur.
-
-    Entrées:
-        frame (np.ndarray): Image source pour calculs de dimensions.
-        tracks (list): Liste d'objets track DeepSort.
-
-    Sortie:
-        None (affiche une fenêtre avec points et ratios).
-
-    Crée un canevas blanc de la taille de l'image, calcule centre et ratio pour chaque track,
-    dessine un cercle rouge au centre et affiche le ratio à côté.
-    """
-    height, width, _ = frame.shape
-    blank = 255 * np.ones((height, width, 3), dtype=np.uint8)
-    for track in tracks:
-        if not track.is_confirmed():
-            continue
-        x1, y1, x2, y2 = map(int, track.to_ltrb())
-        center_x = int((x1 + x2) / 2)
-        center_y = int((y1 + y2) / 2)
-        box_width = x2 - x1
-        box_height = y2 - y1
-        ratio = box_height / box_width if box_width != 0 else 0
-        cv2.circle(blank, (center_x, center_y), 8, (0, 0, 255), -1)
-        cv2.putText(blank, f"{ratio:.2f}", (center_x + 10, center_y + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    show_in_window("Center & Ratio", blank)
-
-
-def update_yolo_window(frame, yolo_detections_boxes):
-    """
-    Affiche les détections YOLO sur l'image.
-
-    Entrées:
-        frame (np.ndarray): Image sur laquelle dessiner.
-        yolo_detections_boxes (list of tuples): Liste de boîtes (x1, y1, x2, y2).
-
-    Sortie:
-        None (affiche les boîtes YOLO dans une fenêtre dédiée).
-
-    Clone l'image, dessine chaque bbox en jaune avec le label "YOLO", puis affiche.
-    """
-    frame_yolo = frame.copy()
-    for (x1, y1, x2, y2) in yolo_detections_boxes:
-        cv2.rectangle(frame_yolo, (x1, y1), (x2, y2), (0, 255, 255), 4)
-        cv2.putText(frame_yolo, "YOLO", (x1, y1 - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    show_in_window("YOLO Detections", frame_yolo)
-
-
-def update_candidate_tracking_window_with_smoothing(frame, candidate_track):
-    """
-    Affiche la position lissée du candidat dans une fenêtre dédiée.
-
-    Entrées:
-        frame (np.ndarray): Image de référence pour les dimensions.
-        candidate_track (Track object): Objet track du candidat.
-
-    Sortie:
-        None (affiche la trajectoire lissée).
-
-    Extrait le centre du bbox du candidat, met à jour l'état lissé via update_smoothed_candidate_point,
-    puis affiche le résultat sur un canevas blanc.
-    """
-    blank = 255 * np.ones_like(frame, dtype=np.uint8)
-    x1, y1, x2, y2 = map(int, candidate_track.to_ltrb())
-    center_x = int((x1 + x2) / 2)
-    center_y = int((y1 + y2) / 2)
-    cv2.circle(blank, (center_x, center_y), 8, (0, 0, 255), -1)
-    update_smoothed_candidate_point(blank, (center_x, center_y))
-    show_in_window("Candidate Tracking", blank)
-
-
-def update_smoothed_candidate_point(frame, target_center):
-    """
-    Calcule et trace la position lissée du point cible avec envoi au servo.
-
-    Entrées:
-        frame (np.ndarray): Canevas sur lequel dessiner.
-        target_center (tuple): Coordonnées (x, y) du point à lisser.
-
-    Sortie:
-        None (dessine sur frame et envoie angle si nécessaire).
-
-    Implémente un modèle de masse-ressort avec friction pour lisser le mouvement,
-    trace l'ancien et nouveau vecteur, calcule l'angle pour le servo,
-    et envoie la commande via port série si >1s depuis dernier envoi.
-    """
-    global smoothed_state, ser, last_com_send_time
-    attraction = 0.02
-    friction = 0.85
-    threshold = 2
-    target_x, target_y = target_center
-    if not smoothed_state["initialized"]:
-        smoothed_state["x"] = target_x
-        smoothed_state["y"] = target_y
-        smoothed_state["vx"] = 0
-        smoothed_state["vy"] = 0
-        smoothed_state["initialized"] = True
-
-    old_x, old_y = smoothed_state["x"], smoothed_state["y"]
-    dx = target_x - smoothed_state["x"]
-    dy = target_y - smoothed_state["y"]
-    dist = np.sqrt(dx**2 + dy**2)
-    if dist > threshold:
-        direction_x = dx / dist
-        direction_y = dy / dist
-        force = dist * attraction
-        smoothed_state["vx"] += direction_x * force
-        smoothed_state["vy"] += direction_y * force
+# ——————————————————————————————————
+# PROCESSING FUNCTIONS (non-distance)
+# ——————————————————————————————————
+def read_frame():
+    if USE_STREAM:
+        return read_stream_frame()
     else:
-        smoothed_state["x"] = target_x
-        smoothed_state["y"] = target_y
-        smoothed_state["vx"] = 0
-        smoothed_state["vy"] = 0
+        return cap.read()
 
-    smoothed_state["vx"] *= friction
-    smoothed_state["vy"] *= friction
-    smoothed_state["x"] += smoothed_state["vx"]
-    smoothed_state["y"] += smoothed_state["vy"]
+def infer_pose(frame):
+    res = model(frame, verbose=False)[0]
+    if res.keypoints is None or not res.boxes:
+        return res, np.zeros((0,17,2)), np.zeros((0,17)), np.zeros((0,4),int), np.array([])
+    xy    = res.keypoints.xy.cpu().numpy()
+    conf  = res.keypoints.conf.cpu().numpy()
+    boxes = res.boxes.xyxy.cpu().numpy().astype(int)
+    confs = res.boxes.conf.cpu().numpy() if hasattr(res.boxes,'conf') else np.ones(len(boxes))
+    return res, xy, conf, boxes, confs
 
-    vec_old = np.array([target_x - old_x, target_y - old_y])
-    vec_new = np.array([target_x - smoothed_state["x"], target_y - smoothed_state["y"]])
-    if np.dot(vec_old, vec_new) <= 0:
-        smoothed_state["x"] = target_x
-        smoothed_state["y"] = target_y
-        smoothed_state["vx"] = 0
-        smoothed_state["vy"] = 0
+def score_ransac(xy_person, conf_person, thresh_deg):
+    pts = [tuple(xy_person[i]) for i in JOINT_INDICES if conf_person[i] > CONF_THRESH]
+    if len(pts) < 2:
+        return 0.0
+    best = 0
+    for i in range(len(pts)):
+        for j in range(i+1, len(pts)):
+            p1, p2 = pts[i], pts[j]
+            angle = abs(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])))
+            angle = min(angle, 180 - angle)
+            if angle > thresh_deg:
+                continue
+            inliers = sum(
+                min(abs(math.degrees(math.atan2(p[1]-p1[1], p[0]-p1[0]))),
+                    180 - abs(math.degrees(math.atan2(p[1]-p1[1], p[0]-p1[0]))))
+                <= thresh_deg for p in pts
+            )
+            best = max(best, inliers)
+    return 100.0 * best / len(pts)
 
-    x_lisse = int(smoothed_state["x"])
-    y_lisse = int(smoothed_state["y"])
-    cv2.circle(frame, (x_lisse, y_lisse), 8, (255, 0, 0), -1)
-    height, width, _ = frame.shape
-    ref_point = (width // 2, height)
-    cv2.circle(frame, ref_point, 8, (0, 255, 0), -1)
-    dir_x = x_lisse - ref_point[0]
-    dir_y = y_lisse - ref_point[1]
-    magnitude = np.sqrt(dir_x**2 + dir_y**2)
-    if magnitude > 1e-3:
-        unit_dir_x = dir_x / magnitude
-        unit_dir_y = dir_y / magnitude
-        small_line_length = 40
-        endpoint = (int(ref_point[0] + unit_dir_x * small_line_length),
-                    int(ref_point[1] + unit_dir_y * small_line_length))
-        cv2.line(frame, ref_point, endpoint, (255, 0, 255), 3)
-        angle_deg = np.degrees(np.arctan2(dir_x, -dir_y))
-        cv2.putText(frame, f"{angle_deg:.1f} deg", (endpoint[0] + 10, endpoint[1]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
-        # Traitement de l'angle pour le servo
-        processed_angle = angle(angle_deg)
-        current_time = time.time()
-        if current_time - last_com_send_time >= 1:
-            if ser is not None and ser.is_open:
-                try:
-                    message = f"{processed_angle:.1f}\n"
-                    ser.write(message.encode('utf-8'))
-                    last_com_send_time = current_time
-                except Exception as e:
-                    print("Erreur lors de l'envoi via le port COM:", e)
-        cv2.putText(frame, f"Angle: {processed_angle:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+def update_duration(is_tpose: bool) -> bool:
+    now = time.time()
+    if not is_tpose:
+        times['start'] = times['last'] = None
+        return False
+    if times['last'] and now - times['last'] > FRAME_GAP:
+        times['start'] = now
+    if times['start'] is None:
+        times['start'] = now
+    times['last'] = now
+    return (now - times['start']) >= HOLD_TIME
 
-# =============================================================================
-# Calibration via une image de référence (Mediapipe)
-# =============================================================================
+def update_tracker(boxes, confs, frame):
+    dets = [([int(x1),int(y1),int(x2-x1),int(y2-y1)], float(c), 'person')
+            for (x1,y1,x2,y2), c in zip(boxes, confs)]
+    return tracker.update_tracks(dets, frame=frame)
 
-def calibrate_from_reference(ref_image_path, known_height_cm, known_distance_cm):
+def compute_angle(p1, p2):
+    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
+    return abs(np.degrees(np.arctan2(dy, dx)))
+
+def annotate_angle(frame, center):
+    h, w = frame.shape[:2]
+    ref = (w//2, h)
+    cv2.line(frame, ref, center, (255,0,255), 2)
+    ang = compute_angle(center, ref)
+    cv2.putText(frame, f"{ang:.1f}°", (ref[0]+10,ref[1]-10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,255), 2)
+    return ang
+
+# ——————————————————————————————————
+# NOUVELLES FONCTIONS POUR L’ESTIMATION DE DISTANCE
+# ——————————————————————————————————
+def angle_between(p1, p2):
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    return abs(np.degrees(np.arctan2(dy, dx)))
+
+def pixel_segments_with_weights(xy, conf):
+    pairs = {
+        'shoulder_shoulder':    (LSH, RSH),
+        'left_shoulder_elbow':  (LSH, LEL),
+        'left_elbow_wrist':     (LEL, LWR),
+        'right_shoulder_elbow': (RSH, REL),
+        'right_elbow_wrist':    (REL, RWR),
+        'span_wrist_wrist':     (LWR, RWR)
+    }
+    px, w = {}, {}
+    for name, (i, j) in pairs.items():
+        if conf[i] > CONF_THRESH and conf[j] > CONF_THRESH:
+            dist_px = np.hypot(*(xy[i] - xy[j]))
+            ang     = angle_between(xy[i], xy[j])
+            weight  = max(0.0, np.cos(np.radians(ang)))
+            px[name] = dist_px
+            w[name]  = weight
+    return px, w
+
+def detect(model, frame):
+    res = model(frame, verbose=False)[0]
+    if res.keypoints is None or not res.boxes:
+        return None, None, None
+    box = res.boxes.xyxy.cpu().numpy()[0].astype(int)
+    xy  = res.keypoints.xy.cpu().numpy()[0]
+    conf= res.keypoints.conf.cpu().numpy()[0]
+    return xy, conf, box
+
+def calibrate_focal_sum(model: YOLO, calib_dir: str = CALIB_DIR) -> float:
     """
-    Calibre la caméra à partir d'une image de référence en calculant la focale.
-
-    Entrées:
-        ref_image_path (str): Chemin vers l'image de référence contenant une pose humaine.
-        known_height_cm (float): Hauteur réelle de la personne en cm (envergure bras étendus).
-        known_distance_cm (float): Distance de la personne à la caméra en cm.
-
-    Sortie:
-        focal_length (float | None): Focale effective calculée en pixels, ou None si échec.
-
-    Utilise Mediapipe pour détecter la pose, extrait la distance pixel entre poignets,
-    puis applique le modèle du trou de serrure (pinhole) pour estimer la focale.
+    Calibre la focale en médiane sur toutes les images de calibration de `calib_dir`.
+    Chaque fichier doit être nommé comme: <ts>_<span_cm>cm_<dist_cm>cm.<ext>
     """
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5)
-    ref_image = cv2.imread(ref_image_path)
-    if ref_image is None:
-        print("Erreur : Impossible de charger l'image de référence.")
+    # Regex pour extraire span et distance depuis le nom de fichier
+    pattern = re.compile(r'.*_(\d+(?:\.\d+)?)cm_(\d+(?:\.\d+)?)cm\.\w+$')
+    focals = []
+
+    # Parcours de toutes les images du dossier
+    for filepath in glob.glob(os.path.join(calib_dir, '*')):
+        fname = os.path.basename(filepath)
+        m = pattern.match(fname)
+        if not m:
+            # nom non conforme, on ignore
+            continue
+
+        span_cm = float(m.group(1))
+        dist_cm = float(m.group(2))
+
+        img = cv2.imread(filepath)
+        if img is None:
+            # image illisible, on ignore
+            continue
+
+        # détection des points clés
+        xy, conf, _ = detect(model, img)
+        if xy is None:
+            # pas de détection, on ignore
+            continue
+
+        # segments en pixels et poids
+        px, w = pixel_segments_with_weights(xy, conf)
+        sum_wpx = sum(w[s] * px[s] for s in px)
+
+        # recalcul des longueurs réelles, en injectant span_cm
+        real_segments = {
+            **{k: PROPORTIONS[k] * REAL_HEIGHT_CM for k in PROPORTIONS},
+            'span_wrist_wrist': span_cm
+        }
+        sum_wreal = sum(w[s] * real_segments[s] for s in px)
+
+        # si insuffisant, on ignore
+        if sum_wpx <= 1e-6 or sum_wreal <= 1e-6:
+            continue
+
+        # focale pour cette image
+        focals.append(sum_wpx * dist_cm / sum_wreal)
+
+    if not focals:
+        raise RuntimeError("Calibration impossible : aucune image valide dans le dossier.")
+
+    # on retourne la médiane des focales calculées
+    return float(np.median(focals))
+
+def estimate_distance_sum(xy, conf, focal_sum: float) -> float:
+    px, w = pixel_segments_with_weights(xy, conf)
+    sum_wpx   = sum(w[s] * px[s] for s in px)
+    sum_wreal = sum(w[s] * REAL_SEGMENTS[s] for s in px)
+    if sum_wpx <= 1e-6 or sum_wreal <= 1e-6:
         return None
-    height_img, width_img, _ = ref_image.shape
+    return focal_sum * (sum_wreal / sum_wpx) * DIST_CORRECTION
 
-    image_rgb = cv2.cvtColor(ref_image, cv2.COLOR_BGR2RGB)
-    results = pose.process(image_rgb)
-    if not results.pose_landmarks:
-        print("Aucune pose détectée dans l'image de référence.")
-        return None
+def draw_overlay(frame, box, dist=None):
+    x1, y1, x2, y2 = box
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    if dist is not None:
+        cv2.putText(frame,
+                    f"{dist:.1f} cm",
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2)
 
-    left_wrist = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_WRIST]
-    right_wrist = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_WRIST]
+# ——————————————————————————————————
+# Fonctions de tracking et mapping améliorées
+# ——————————————————————————————————
+def select_tpose_target(tracks, boxes, xy_all, conf_all, ref_index):
+    MAX_KEYPOINT_DIST = 100.0
+    ref_pts = xy_all[ref_index][[LSH, RSH, LWR, RWR]]
+    ref_center = np.mean(ref_pts, axis=0)
+    for t in tracks:
+        if not t.is_confirmed():
+            continue
+        tb = tuple(map(int, t.to_ltrb()))
+        ious = np.array([iou(tb, b) for b in boxes])
+        if ious.size == 0:
+            continue
+        idx = int(np.argmax(ious))
+        if ious[idx] < IOU_MAPPING_THRESHOLD:
+            continue
+        cand_pts = xy_all[idx][[LSH, RSH, LWR, RWR]]
+        cand_center = np.mean(cand_pts, axis=0)
+        if np.linalg.norm(ref_center - cand_center) < MAX_KEYPOINT_DIST:
+            return t.track_id
+    return None
 
-    left_x = left_wrist.x * width_img
-    left_y = left_wrist.y * height_img
-    right_x = right_wrist.x * width_img
-    right_y = right_wrist.y * height_img
+def iou(boxA, boxB):
+    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
+    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    aA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    aB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    return inter / (aA + aB - inter) if (aA + aB - inter) > 0 else 0.0
 
-    arm_span_pixels = math.dist((left_x, left_y), (right_x, right_y))
-    print(f"Envergure dans l'image de référence : {arm_span_pixels:.2f} pixels")
+def calibrate_step(frame, xy, conf, boxes):
+    ts = datetime.datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
+    span_cm = float(input('Envergure (cm): '))
+    dist_cm = float(input('Distance (cm): '))
+    ann = frame.copy()
+    fname = f"{ts}_{int(span_cm)}cm_{int(dist_cm)}cm.jpg"
+    path = os.path.join(CALIB_DIR, fname)
+    cv2.imwrite(path, ann)
+    print(f"Saved calibration: {path}")
 
-    focal_length = (arm_span_pixels * known_distance_cm) / known_height_cm
-    print(f"Focale calculée : {focal_length:.2f} pixels")
+# ——————————————————————————————————
+# MAIN LOOP
+# ——————————————————————————————————
+def run():
+    global cap, tracker, state, times
+    win = 'T-pose Detector'
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
-    pose.close()
-    return focal_length
+    init_camera()
+    init_model()
 
-# =============================================================================
-# Partie principale : fusion des deux traitements
-# =============================================================================
-if __name__ == "__main__":
-    # --- Calibration par image de référence ---
-    reference_image_path = "reference.jpg"
-    known_height_cm = 175
-    known_distance_cm = 222
+    # calibration unique à partir d'une image de référence
+    focal_sum = calibrate_focal_sum(model, 'calib_data')
+    print(f"Focale calibrée = {focal_sum:.1f}px")
 
-    focal_length = calibrate_from_reference(reference_image_path, known_height_cm, known_distance_cm)
-    if focal_length is None:
-        print("Calibration échouée.")
-        exit(1)
+    init_tracker()
+    times['prev_frame'] = time.perf_counter()
 
-    # --- Initialisation YOLO et DeepSORT ---
-    CLASSES_TO_DETECT = ["person"]
-    CONFIDENCE_THRESHOLD = 0.6  
-    TRACKING_CONFIRMATION_TIME = 4.0
+    while True:
+        now = time.perf_counter()
+        ret, frame = read_frame()
+        if not ret:
+            break
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('m'):
+            state['mode'] = 'manual'
+        elif key == ord('a'):
+            state['mode'] = 'auto'
+            state['auto_phase'] = 'search'
+            times['start'] = times['last'] = None
+        elif key == ord('c'):
+            state['mode'] = 'config'
+        elif key == ord('+') and USE_STREAM:
+            send_control(b'+')
+        elif key == ord('-') and USE_STREAM:
+            send_control(b'-')
+        elif key in (ord('q'), 27):
+            break
 
-    yoloModel = YOLO("yolo11n.pt")
-    tracker = DeepSort(max_age=50, n_init=10, nms_max_overlap=10, 
-                       max_iou_distance=0.9, max_cosine_distance=0.6)
+        if state['mode'] in ('config', 'auto'):
+            res, xy_all, conf_all, boxes, confs = infer_pose(frame)
 
-    try:
-        ser = serial.Serial('COM5', 9600)
-        time.sleep(2)  # Attente de la réinitialisation de l'Arduino
-    except Exception as e:
-        print("Erreur lors de l'ouverture du port COM:", e)
-        ser = None
+        if state['mode'] == 'config':
+            # 1) Affichage du squelette ou de l'image brute
+            img = res.plot() if DRAW_SKELETON else frame.copy()
 
-    cap = cv2.VideoCapture(0)
-    if cap is None or not cap.isOpened():
-        print("Warning: unable to open video source")
-        exit(1)
+            # 2) On calcule un score pour chaque boîte et on choisit la couleur
+            tpose_scores = []
+            for i, box in enumerate(boxes):
+                sc = score_ransac(xy_all[i], conf_all[i], HORIZONTAL_THRESHOLD_DEG)
+                tpose_scores.append(sc)
+                color = (0, 255, 0) if sc >= SCORE_OK else (0, 255, 255)
+                x1, y1, x2, y2 = box
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            # 3) Affichage
+            cv2.imshow(win, img)
 
-    # --- Création des fenêtres d'affichage ---
-    for name, (w, h) in window_sizes.items():
-        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(name, w, h)
+            # 4) Si la T-pose (au moins une boîte verte) est tenue assez longtemps, on calibre
+            if update_duration(any(sc >= SCORE_OK for sc in tpose_scores)):
+                calibrate_step(frame, xy_all, conf_all, boxes)
 
-    cv2.moveWindow("YOLO Detections", 0, 0)
-    cv2.moveWindow("DeepSORT Tracking", window_sizes["DeepSORT Tracking"][0], 0)
-    cv2.moveWindow("Center & Ratio", 0, window_sizes["DeepSORT Tracking"][1])
-    cv2.moveWindow("Candidate Tracking", window_sizes["DeepSORT Tracking"][0], window_sizes["DeepSORT Tracking"][1])
-    cv2.namedWindow("Distance Estimation", cv2.WINDOW_NORMAL)
+        elif state['mode'] == 'manual':
+            disp = frame.copy()
+            cv2.putText(disp, 'MODE MANUEL', (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.imshow(win, disp)
 
-    # --- Initialisation de Mediapipe pour la pose ---
-    mp_pose_instance = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-    mp_drawing = mp.solutions.drawing_utils
+        else:  # auto mode
+            if state['auto_phase'] == 'search':
+                img = res.plot() if DRAW_SKELETON else frame.copy()
+                for i, box in enumerate(boxes):
+                    sc = score_ransac(xy_all[i], conf_all[i], HORIZONTAL_THRESHOLD_DEG)
+                    color = (255, 0, 0) if sc >= SCORE_OK else (0, 255, 255)
+                    x1, y1, x2, y2 = box
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                cv2.imshow(win, img)
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Impossible de lire la vidéo depuis la caméra.")
-                break
-
-            # ---------------------------
-            # Traitement par YOLO / DeepSORT
-            # ---------------------------
-            frame_tracking = frame.copy()
-            yoloResult = yoloModel(frame_tracking)
-            detections = []              # Format: ([x, y, w, h], conf, class_id)
-            yolo_detections_boxes = []   # Format: (x1, y1, x2, y2)
-
-            for result in yoloResult[0].boxes:
-                x1, y1, x2, y2 = map(int, result.xyxy[0].tolist())
-                conf = result.conf[0].item()
-                class_id = int(result.cls[0])
-                class_name = yoloModel.names[class_id] if hasattr(yoloModel, 'names') else str(class_id)
-                if class_name in CLASSES_TO_DETECT and conf >= CONFIDENCE_THRESHOLD:
-                    detections.append(([x1, y1, x2 - x1, y2 - y1], conf, class_id))
-                    yolo_detections_boxes.append((x1, y1, x2, y2))
-
-            tracks = tracker.update_tracks(detections, frame=frame_tracking)
-            update_tracking_window(frame_tracking.copy(), tracks, candidate_id, tracking_confirmed)
-            update_center_ratio_window(frame_tracking, tracks)
-            update_yolo_window(frame_tracking, yolo_detections_boxes)
-
-            candidate_track_obj = None
-            candidate_found = False
-
-            for track in tracks:
-                if not track.is_confirmed():
-                    continue
-                x1, y1, x2, y2 = map(int, track.to_ltrb())
-                box_width = x2 - x1
-                box_height = y2 - y1
-                ratio = box_height / box_width if box_width != 0 else 0
-                hlRatio = 0.83
-                if candidate_id is None:
-                    if ratio < hlRatio:
-                        candidate_id = track.track_id
-                        candidate_start_time = time.time()
-                        candidate_track_obj = track
-                        candidate_found = True
-                        break
-                else:
-                    if track.track_id == candidate_id:
-                        candidate_found = True
-                        candidate_track_obj = track
-                        if not tracking_confirmed:
-                            if ratio < hlRatio:
-                                if time.time() - candidate_start_time >= TRACKING_CONFIRMATION_TIME:
-                                    tracking_confirmed = True
-                            else:
-                                candidate_id = None
-                                candidate_start_time = 0
-                                tracking_confirmed = False
-                        break
-
-            if not candidate_found:
-                candidate_id = None
-                candidate_start_time = 0
-                tracking_confirmed = False
-                smoothed_state["initialized"] = False
-
-            if tracking_confirmed and candidate_track_obj is not None:
-                update_candidate_tracking_window_with_smoothing(frame_tracking.copy(), candidate_track_obj)
-            else:
-                blank_candidate = 255 * np.ones_like(frame_tracking, dtype=np.uint8)
-                cv2.putText(blank_candidate, "No Candidate Tracking", (50, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                show_in_window("Candidate Tracking", blank_candidate)
-
-            # ---------------------------
-            # Traitement de la pose (Mediapipe) et estimation de distance
-            # ---------------------------
-            frame_pose = frame.copy()
-            image_rgb = cv2.cvtColor(frame_pose, cv2.COLOR_BGR2RGB)
-            image_rgb.flags.writeable = False
-            results_pose = mp_pose_instance.process(image_rgb)
-            image_rgb.flags.writeable = True
-            image_pose = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-            height_img, width_img, _ = image_pose.shape
-
-            if results_pose.pose_landmarks:
-                landmarks = results_pose.pose_landmarks.landmark
-
-                def to_pixel(pt):
-                    return (int(pt.x * width_img), int(pt.y * height_img))
-
-                lsh = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER])
-                rsh = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER])
-                leb = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.LEFT_ELBOW])
-                reb = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.RIGHT_ELBOW])
-                lwr = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.LEFT_WRIST])
-                rwr = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.RIGHT_WRIST])
-                lhip = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.LEFT_HIP])
-                rhip = to_pixel(landmarks[mp.solutions.pose.PoseLandmark.RIGHT_HIP])
-
-                def eucl_dist(a, b):
-                    return math.dist(a, b)
-
-                left_upper_arm = eucl_dist(lsh, leb)
-                left_forearm = eucl_dist(leb, lwr)
-                right_upper_arm = eucl_dist(rsh, reb)
-                right_forearm = eucl_dist(reb, rwr)
-                left_trunk = eucl_dist(lsh, lhip)
-                right_trunk = eucl_dist(rsh, rhip)
-                shoulder_width = eucl_dist(lsh, rsh)
-
-                distances = [
-                    left_upper_arm,
-                    left_forearm,
-                    right_upper_arm,
-                    right_forearm,
-                    left_trunk,
-                    right_trunk,
-                    shoulder_width
+                tpose_scores = [
+                    score_ransac(xy_all[j], conf_all[j], HORIZONTAL_THRESHOLD_DEG)
+                    for j in range(len(boxes))
                 ]
-                global_distance = np.median(distances)
-                if global_distance != 0:
-                    ratio_distance = 1.6
-                    estimated_distance = ((known_height_cm * focal_length) / global_distance ) * ratio_distance
-                else:
-                    estimated_distance = 0
+                if update_duration(any(sc >= SCORE_OK for sc in tpose_scores)):
+                    tpose_index = int(np.argmax(tpose_scores))
+                    tracks = update_tracker(boxes, confs, frame)
+                    state['selected_id'] = select_tpose_target(
+                        tracks, boxes, xy_all, conf_all, tpose_index
+                    )
+                    if state['selected_id']:
+                        state['auto_phase'] = 'track'
 
-                cv2.putText(image_pose, f"Distance: {estimated_distance:.2f} cm", (30, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            else:  # tracking phase
+                tracks = update_tracker(boxes, confs, frame)
+                ann = frame.copy()
+                for t in tracks:
+                    if not (t.is_confirmed() and t.track_id == state['selected_id']):
+                        continue
 
-                for ptA, ptB, color in [
-                    (lsh, leb, (255, 0, 0)),
-                    (leb, lwr, (0, 255, 0)),
-                    (rsh, reb, (255, 0, 0)),
-                    (reb, rwr, (0, 255, 0)),
-                    (lsh, lhip, (0, 165, 255)),
-                    (rsh, rhip, (0, 165, 255)),
-                    (lsh, rsh, (0, 255, 255))
-                ]:
-                    cv2.line(image_pose, ptA, ptB, color, 3)
-                    cv2.circle(image_pose, ptA, 5, (0, 0, 255), -1)
-                    cv2.circle(image_pose, ptB, 5, (0, 0, 255), -1)
+                    # Si pas de box ni de keypoints, on skippe
+                    if len(boxes) == 0 or len(xy_all) == 0:
+                        continue
 
-                mp_drawing.draw_landmarks(image_pose, results_pose.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
-            else:
-                cv2.putText(image_pose, "Aucune pose detectee", (30, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    x1, y1, x2, y2 = map(int, t.to_ltrb())
+                    # calcul des IoU avec les boîtes détectées
+                    ious = [iou((x1, y1, x2, y2), b) for b in boxes]
+                    if not ious:
+                        continue
 
-            cv2.imshow("Distance Estimation", image_pose)
+                    idx = int(np.argmax(ious))
+                    # là on est sûrs que idx < len(xy_all)
+                    xy, conf = xy_all[idx], conf_all[idx]
+                    dist = estimate_distance_sum(xy, conf, focal_sum)
 
-            key = cv2.waitKey(10)
-            if key == 27 or key == ord('q'):
-                break
-    finally:
+                    draw_overlay(ann, (x1, y1, x2, y2), dist)
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    annotate_angle(ann, (cx, cy))
+                    break
+                cv2.imshow(win, ann)
+
+                if not any(t.track_id == state['selected_id'] and t.is_confirmed() for t in tracks):
+                    state['auto_phase'] = 'search'
+                    times['start'] = times['last'] = None
+                    state['selected_id'] = None
+
+        if DISPLAY_PROCESS_TIME:
+            print(f"[{state['mode'].upper()}:{state.get('auto_phase','')}] "
+                  f"{(time.perf_counter()-now)*1000:.1f} ms")
+
+    # fermeture de la source vidéo
+    if USE_STREAM:
+        close_stream()
+    else:
         cap.release()
-        cv2.destroyAllWindows()
-        if ser is not None and ser.is_open:
-            ser.close()
-        mp_pose_instance.close()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    run()

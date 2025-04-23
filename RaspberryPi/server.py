@@ -2,6 +2,7 @@ import socket
 import struct
 import time
 import json
+import errno
 from picamera2 import Picamera2
 import cv2
 
@@ -15,9 +16,9 @@ HEADER_FMT = "Q"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 PRESETS = {
-    "HIGH":   {"quality": 90, "use_gray": False, "resize_factor": 1.0},
-    "MEDIUM": {"quality": 60, "use_gray": False, "resize_factor": 0.75},
-    "LOW":    {"quality": 30, "use_gray": True,  "resize_factor": 0.5},
+    "HIGH":   {"quality": 90, "use_gray": False, "resize_factor": 0.25},
+    "MEDIUM": {"quality": 60, "use_gray": False, "resize_factor": 0.25},
+    "LOW":    {"quality": 30, "use_gray": True,  "resize_factor": 0.25},
 }
 PRESET_LIST = list(PRESETS.keys())
 DEFAULT_PRESET = "HIGH"
@@ -63,6 +64,26 @@ def encode_frame(frame, quality):
     ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes() if ret else None
 
+def send_all_non_blocking(sock, data):
+    """
+    Envoie integralement 'data' sur la socket non-bloquante 'sock'.
+    En cas de EAGAIN/EWOULDBLOCK, attend tres breve et continue.
+    """
+    total_sent = 0
+    length = len(data)
+    while total_sent < length:
+        try:
+            sent = sock.send(data[total_sent:])
+            if sent == 0:
+                raise RuntimeError("socket connection broken")
+            total_sent += sent
+        except BlockingIOError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                time.sleep(0.001)
+                continue
+            else:
+                raise
+
 def stream_video(conn, cam, res):
     conn.setblocking(False)
     preset = DEFAULT_PRESET
@@ -75,7 +96,6 @@ def stream_video(conn, cam, res):
         if not data:
             continue
 
-        # calcul de la resolution apres reduction
         factor = PRESETS[preset]["resize_factor"]
         w = int(orig_w * factor)
         h = int(orig_h * factor)
@@ -87,15 +107,14 @@ def stream_video(conn, cam, res):
         }).encode()
 
         try:
-            conn.sendall(struct.pack(HEADER_FMT, len(meta)))
-            conn.sendall(meta)
-            conn.sendall(struct.pack(HEADER_FMT, len(data)))
-            conn.sendall(data)
-        except:
-            print("[WARN] Client deco / erreur d'envoi")
+            send_all_non_blocking(conn, struct.pack(HEADER_FMT, len(meta)))
+            send_all_non_blocking(conn, meta)
+            send_all_non_blocking(conn, struct.pack(HEADER_FMT, len(data)))
+            send_all_non_blocking(conn, data)
+        except Exception:
+            print("[WARN] Client deconnecte ou erreur d'envoi")
             break
 
-        # lecture commande + ou - sans reboucler
         try:
             cmd = conn.recv(1)
             idx = PRESET_LIST.index(preset)

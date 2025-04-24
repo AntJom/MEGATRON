@@ -132,6 +132,7 @@ def main():
         init_stream()
         while True:
             ret, frame, meta, size = _read_raw_stream()
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
             if not ret:
                 print("[STREAM] Flux interrompu")
                 break

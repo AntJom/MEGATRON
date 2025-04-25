@@ -9,6 +9,9 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import re
 import glob
+from collections import deque
+
+from serial_comms import DataSender
 
 # Import du client de streaming
 from eye import init_stream, read_stream_frame, send_control, close_stream
@@ -72,12 +75,22 @@ JOINT_INDICES = (7, 9, 8, 10)
 times = {'start': None, 'last': None, 'prev_frame': None}
 state = {'mode': 'manual', 'auto_phase': 'search', 'selected_id': None}
 
+# variables a envoyer sur le port com
+COM_ANGLE = 0
+COM_DIRECTION = 0 # 1 = arrière
+COM_MOTOR_POWER = 0
+
 cap = None
 model = None
 tracker = None
 
 # Basculer entre webcam (False) et streaming réseau (True)
 USE_STREAM = True
+
+# Historique des distances initialisé à 10 zéros
+DIST_HISTORY = deque([0.0] * 10, maxlen=10)
+# Moyenne courante initiale = 0
+COM_DISTANCE = 0.0
 
 # ——————————————————————————————————
 # INITIALIZATION
@@ -112,9 +125,22 @@ def init_tracker():
 # ——————————————————————————————————
 def read_frame():
     if USE_STREAM:
-        return read_stream_frame()
+        frame = None
+        ret   = False
+        # on lit MAX_FLUSH fois et on ne garde que la dernière image valide
+        for _ in range(1):
+            ok, img = read_stream_frame()
+            if not ok:
+                break
+            frame = img   # on ne stocke que l’image
+            ret   = True
+        return ret, frame
+
     else:
-        return cap.read()
+        # pour VideoCapture OpenCV, on jette tout le buffer
+        while cap.grab():
+            pass
+        return cap.retrieve()
 
 def infer_pose(frame):
     res = model(frame, verbose=False)[0]
@@ -164,8 +190,16 @@ def update_tracker(boxes, confs, frame):
     return tracker.update_tracks(dets, frame=frame)
 
 def compute_angle(p1, p2):
+    global COM_ANGLE
     dx, dy = p2[0]-p1[0], p2[1]-p1[1]
-    return abs(np.degrees(np.arctan2(dy, dx)))
+    temp_angle = abs(np.degrees(np.arctan2(dy, dx)))
+    if (temp_angle - 90) > 80:
+        COM_ANGLE = 80
+    elif (temp_angle - 90) < -80:
+        COM_ANGLE = -80
+    else:
+        COM_ANGLE = temp_angle
+    return temp_angle
 
 def annotate_angle(frame, center):
     h, w = frame.shape[:2]
@@ -267,11 +301,20 @@ def calibrate_focal_sum(model: YOLO, calib_dir: str = CALIB_DIR) -> float:
     return float(np.median(focals))
 
 def estimate_distance_sum(xy, conf, focal_sum: float) -> float:
+    global COM_DISTANCE, DIST_HISTORY
     px, w = pixel_segments_with_weights(xy, conf)
     sum_wpx   = sum(w[s] * px[s] for s in px)
     sum_wreal = sum(w[s] * REAL_SEGMENTS[s] for s in px)
     if sum_wpx <= 1e-6 or sum_wreal <= 1e-6:
         return None
+    
+    # 3) distance instantanée
+    dist = focal_sum * (sum_wreal / sum_wpx) * DIST_CORRECTION
+
+    # 4) mise à jour de l’historique
+    DIST_HISTORY.append(dist)
+    # 5) calcul de la moyenne glissante
+    COM_DISTANCE = sum(DIST_HISTORY) / len(DIST_HISTORY)
     return focal_sum * (sum_wreal / sum_wpx) * DIST_CORRECTION
 
 def draw_overlay(frame, box, dist=None):
@@ -330,6 +373,7 @@ def calibrate_step(frame, xy, conf, boxes):
 # ——————————————————————————————————
 def run():
     global cap, tracker, state, times
+    global COM_ANGLE, COM_MOTOR_POWER, COM_DIRECTION
     win = 'T-pose Detector'
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
@@ -342,6 +386,11 @@ def run():
 
     init_tracker()
     times['prev_frame'] = time.perf_counter()
+
+    sender = DataSender(port="COM5", baud=9600)
+    sender.open()
+
+    manual_timer_start = 0
 
     while True:
         now = time.perf_counter()
@@ -363,11 +412,38 @@ def run():
             send_control(b'-')
         elif key in (ord('q'), 27):
             break
+        elif key == ord('s'):   # ←
+            COM_ANGLE = -90
+            COM_MOTOR_POWER = 100
+            COM_DIRECTION = 0
+            manual_timer_start = time.time()
+        elif key == ord('d'): # →
+            COM_ANGLE = 90
+            COM_MOTOR_POWER = 100
+            COM_DIRECTION = 0
+            manual_timer_start = time.time()
+        elif key == ord('z'): # ↑
+            COM_ANGLE = 0
+            COM_MOTOR_POWER = 100
+            COM_DIRECTION = 0
+            manual_timer_start = time.time()
+        elif key == ord('w'): # ↓
+            COM_ANGLE = 0
+            COM_MOTOR_POWER = 100
+            COM_DIRECTION = 1
+            manual_timer_start = time.time()
+
+        if time.time() - manual_timer_start > 2:
+            COM_ANGLE = 0
+            COM_MOTOR_POWER = 0
+            COM_DIRECTION = 1
 
         if state['mode'] in ('config', 'auto'):
             res, xy_all, conf_all, boxes, confs = infer_pose(frame)
 
         if state['mode'] == 'config':
+            COM_MOTOR_POWER = 0
+            sender.send(angle=0, power=0, direction=0)
             # 1) Affichage du squelette ou de l'image brute
             img = res.plot() if DRAW_SKELETON else frame.copy()
 
@@ -391,9 +467,27 @@ def run():
             disp = frame.copy()
             cv2.putText(disp, 'MODE MANUEL', (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            
+            com_texts = [
+                f"Angle       : {COM_ANGLE}",
+                f"Motor power : {COM_MOTOR_POWER}",
+                f"Direction   : {COM_DIRECTION}"
+            ]
+            for i, txt in enumerate(com_texts):
+                # on commence à y=80 puis +30 pixels par ligne
+                y = 80 + i * 30
+                cv2.putText(disp, txt, (20, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+
             cv2.imshow(win, disp)
+            
+            sender.send(angle=COM_ANGLE, power=COM_MOTOR_POWER, direction=COM_DIRECTION)
+
+
 
         else:  # auto mode
+            COM_MOTOR_POWER = 0
             if state['auto_phase'] == 'search':
                 img = res.plot() if DRAW_SKELETON else frame.copy()
                 for i, box in enumerate(boxes):
@@ -401,6 +495,8 @@ def run():
                     color = (255, 0, 0) if sc >= SCORE_OK else (0, 255, 255)
                     x1, y1, x2, y2 = box
                     cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+                
                 cv2.imshow(win, img)
 
                 tpose_scores = [
@@ -441,6 +537,28 @@ def run():
                     draw_overlay(ann, (x1, y1, x2, y2), dist)
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                     annotate_angle(ann, (cx, cy))
+
+                    if COM_DISTANCE > 130:
+                        COM_MOTOR_POWER = 100
+                    else:
+                        COM_MOTOR_POWER = 0
+
+                    sender.send(angle=-(COM_ANGLE-90), power=COM_MOTOR_POWER, direction=COM_DIRECTION)
+
+                    # Affichage des valeurs COM_ en haut à droite
+                    com_texts = [
+                        f"Angle       : {-(COM_ANGLE-90)}",
+                        f"Motor power : {COM_MOTOR_POWER}",
+                        f"Direction   : {COM_DIRECTION}"
+                    ]
+                    for i, txt in enumerate(com_texts):
+                        y = 40 + (i+1)*30   # on décale chaque ligne de 30px
+                        cv2.putText(ann, txt,
+                                    (20, y),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.7,  # taille un peu plus petite qu’en titre
+                                    (255, 255, 255), 2)
+
                     break
                 cv2.imshow(win, ann)
 
@@ -448,10 +566,13 @@ def run():
                     state['auto_phase'] = 'search'
                     times['start'] = times['last'] = None
                     state['selected_id'] = None
+                    
 
         if DISPLAY_PROCESS_TIME:
             print(f"[{state['mode'].upper()}:{state.get('auto_phase','')}] "
                   f"{(time.perf_counter()-now)*1000:.1f} ms")
+            
+        
 
     # fermeture de la source vidéo
     if USE_STREAM:
@@ -459,6 +580,7 @@ def run():
     else:
         cap.release()
     cv2.destroyAllWindows()
+    sender.close()
 
 if __name__ == '__main__':
     run()
